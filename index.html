@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Institutional Market State Engine</title>
+<title>Institutional Stop-Loss Map</title>
 
-<!-- CACHE KILL (GitHub Pages fix) -->
+<!-- Cache kill (GitHub Pages fix) -->
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
@@ -17,8 +17,8 @@
   --border:#152433;
   --text:#e6f0fb;
   --muted:#9fb0c8;
-  --accent:#00d084;
-  --danger:#ff6b6b;
+  --buy:#00d084;
+  --sell:#ff6b6b;
 }
 body{
   margin:0;
@@ -26,7 +26,7 @@ body{
   background:var(--bg);
   color:var(--text);
 }
-.wrap{max-width:1200px;margin:auto;padding:16px}
+.wrap{max-width:1100px;margin:auto;padding:16px}
 .card{
   background:var(--card);
   border:1px solid var(--border);
@@ -34,7 +34,12 @@ body{
   padding:14px;
   margin-bottom:14px;
 }
-.header{display:flex;justify-content:space-between;align-items:center;gap:12px}
+.header{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:12px;
+}
 select,button{
   background:#071b2b;
   color:var(--text);
@@ -43,18 +48,17 @@ select,button{
   padding:8px 10px;
 }
 button{cursor:pointer}
-.state{
-  font-size:20px;
+.price{
+  font-size:28px;
   font-weight:700;
-  margin-top:6px;
 }
-.level{
-  padding:8px;
-  background:rgba(255,255,255,0.03);
+.zone{
+  padding:10px;
   border-radius:8px;
-  margin-bottom:6px;
+  margin-bottom:8px;
 }
-.stop{color:var(--danger);font-size:13px}
+.buyZone{background:rgba(0,208,132,0.08);border:1px solid rgba(0,208,132,0.35)}
+.sellZone{background:rgba(255,107,107,0.08);border:1px solid rgba(255,107,107,0.35)}
 .small{font-size:12px;color:var(--muted)}
 </style>
 </head>
@@ -64,8 +68,8 @@ button{cursor:pointer}
 
 <div class="card header">
   <div>
-    <div style="font-size:20px;font-weight:600">Institutional Market State</div>
-    <div class="small">Execution • Stops • State logic (1H)</div>
+    <div style="font-size:20px;font-weight:600">Institutional Stop-Loss Levels</div>
+    <div class="small">Only high-confidence • Executed-volume derived</div>
   </div>
   <div>
     <select id="symbol"></select>
@@ -76,135 +80,146 @@ button{cursor:pointer}
 
 <div class="card">
   <div class="small">Current Price</div>
-  <div id="price" style="font-size:26px;font-weight:700">—</div>
-  <div class="state" id="state">—</div>
+  <div id="price" class="price">—</div>
 </div>
 
 <div class="card">
-  <div class="small">Major Execution Clusters & Stop Zones</div>
-  <div id="levels" style="margin-top:10px">Waiting…</div>
+  <div class="small">BUY STOP ZONES (Above Price)</div>
+  <div id="buyStops">Building…</div>
+</div>
+
+<div class="card">
+  <div class="small">SELL STOP ZONES (Below Price)</div>
+  <div id="sellStops">Building…</div>
 </div>
 
 </div>
 
 <script>
-/* ==============================
-   STATE ENGINE
-============================== */
-const STATE={
-  ACCUMULATION:'ACCUMULATION',
-  EXECUTION:'EXECUTION',
-  DISTRIBUTION:'DISTRIBUTION',
-  RESET:'RESET'
-};
-
-let clusters=new Map();
-let priceHistory=[];
-let deltaHistory=[];
-let liquidityHistory=[];
-let lastPrice=null;
-let currentState=STATE.RESET;
+/* ===============================
+   CORE DATA STRUCTURES
+================================ */
 let ws=null;
+let lastPrice=null;
+let tradeBuffer=[];
+let hourBuckets=new Map();
+let finalizedZones={ buy:[], sell:[] };
 
+/* ===============================
+   HELPERS
+================================ */
 function avg(a){return a.reduce((x,y)=>x+y,0)/a.length||0}
-
-function updateState(){
-  const vol=Math.max(...priceHistory)-Math.min(...priceHistory);
-  const delta=avg(deltaHistory);
-  const liq=avg(liquidityHistory);
-
-  if(vol<liq*0.15 && Math.abs(delta)<liq*0.1) currentState=STATE.ACCUMULATION;
-  else if(Math.abs(delta)>liq*0.6) currentState=STATE.EXECUTION;
-  else if(vol>liq*0.4 && Math.abs(delta)<liq*0.2) currentState=STATE.DISTRIBUTION;
-  else if(vol<liq*0.08) currentState=STATE.RESET;
-
-  document.getElementById('state').innerText=currentState;
-}
-
-/* ==============================
-   CLUSTER & STOP LOGIC
-============================== */
 function binSize(p){return p>=1000?100:p*0.01}
 
+/* ===============================
+   EXECUTION BUCKET (1H)
+================================ */
 function addTrade(price,qty,side){
-  const b=binSize(price);
-  const key=Math.round(price/b)*b;
-  if(!clusters.has(key)) clusters.set(key,{price:key,vol:0,buy:0,sell:0});
-  const c=clusters.get(key);
+  const hour=Math.floor(Date.now()/3600000);
+  if(!hourBuckets.has(hour)){
+    hourBuckets.set(hour,new Map());
+  }
+  const bucket=hourBuckets.get(hour);
+  const bin=binSize(price);
+  const key=Math.round(price/bin)*bin;
+
+  if(!bucket.has(key)){
+    bucket.set(key,{price:key,vol:0,delta:0});
+  }
+  const c=bucket.get(key);
   c.vol+=qty;
-  side==='buy'?c.buy+=qty:c.sell+=qty;
+  c.delta+=side==='buy'?qty:-qty;
 }
 
-function majorClusters(){
-  const arr=[...clusters.values()];
-  if(arr.length<5) return [];
-  const a=avg(arr.map(x=>x.vol));
-  return arr.filter(x=>x.vol>a*1.8).sort((a,b)=>b.vol-a.vol).slice(0,6);
+/* ===============================
+   STOP-ZONE EXTRACTION
+================================ */
+function finalizeHour(){
+  if(hourBuckets.size<2) return;
+
+  const hours=[...hourBuckets.keys()].sort();
+  const prev=hourBuckets.get(hours[hours.length-2]);
+
+  const clusters=[...prev.values()];
+  if(clusters.length<5) return;
+
+  const avgVol=avg(clusters.map(c=>c.vol));
+
+  clusters
+    .filter(c=>c.vol>avgVol*2) // 🔴 ONLY BIG
+    .forEach(c=>{
+      if(c.delta>0){
+        // BUY aggression failed → SELL STOPS BELOW
+        finalizedZones.sell.push({
+          from:c.price-binSize(c.price)*2,
+          to:c.price-binSize(c.price)
+        });
+      }else{
+        // SELL aggression failed → BUY STOPS ABOVE
+        finalizedZones.buy.push({
+          from:c.price+binSize(c.price),
+          to:c.price+binSize(c.price)*2
+        });
+      }
+    });
+
+  hourBuckets.delete(hours[0]); // keep memory small
 }
 
-function stopZones(c){
-  const range=binSize(c.price)*2;
-  if(c.sell>c.buy*1.5){
-    return {type:'BUY STOPS',from:c.price+range,to:c.price+range*1.5};
-  }
-  if(c.buy>c.sell*1.5){
-    return {type:'SELL STOPS',from:c.price-range*1.5,to:c.price-range};
-  }
-  return null;
-}
-
-/* ==============================
-   RENDER
-============================== */
+/* ===============================
+   RENDER (STABLE, NO JUMPING)
+================================ */
 function render(){
   if(!lastPrice) return;
   document.getElementById('price').innerText=lastPrice.toFixed(2);
-  updateState();
 
-  const el=document.getElementById('levels');
-  const majors=majorClusters();
-  if(!majors.length){el.innerHTML='Building…';return;}
+  const buys=finalizedZones.buy.filter(z=>z.from>lastPrice);
+  const sells=finalizedZones.sell.filter(z=>z.to<lastPrice);
 
-  el.innerHTML=majors.map(c=>{
-    const s=stopZones(c);
-    return `
-      <div class="level">
-        <b>${c.price.toFixed(2)}</b> — Vol ${c.vol.toFixed(0)}
-        ${s?`<div class="stop">${s.type}: ${s.from.toFixed(2)} → ${s.to.toFixed(2)}</div>`:''}
-      </div>`;
-  }).join('');
+  document.getElementById('buyStops').innerHTML=
+    buys.length?buys.slice(0,5).map(z=>`
+      <div class="zone buyZone">
+        ${z.from.toFixed(2)} → ${z.to.toFixed(2)}
+      </div>`).join(''):'—';
+
+  document.getElementById('sellStops').innerHTML=
+    sells.length?sells.slice(0,5).map(z=>`
+      <div class="zone sellZone">
+        ${z.from.toFixed(2)} → ${z.to.toFixed(2)}
+      </div>`).join(''):'—';
 }
 
-/* ==============================
-   BINANCE DATA
-============================== */
+/* ===============================
+   BINANCE CONNECTION
+================================ */
 async function loadSymbols(){
   const r=await fetch('https://fapi.binance.com/fapi/v1/exchangeInfo');
   const d=await r.json();
-  document.getElementById('symbol').innerHTML=
-    d.symbols.filter(s=>s.contractType==='PERPETUAL')
+  symbol.innerHTML=d.symbols
+    .filter(s=>s.contractType==='PERPETUAL')
     .map(s=>`<option>${s.symbol}</option>`).join('');
 }
 
-document.getElementById('connect').onclick=()=>{
+connect.onclick=()=>{
   if(ws) ws.close();
-  clusters.clear();
-  priceHistory=[];
-  deltaHistory=[];
-  liquidityHistory=[];
-  const sym=document.getElementById('symbol').value.toLowerCase();
+  finalizedZones={buy:[],sell:[]};
+  hourBuckets.clear();
+
+  const sym=symbol.value.toLowerCase();
   ws=new WebSocket(`wss://fstream.binance.com/ws/${sym}@aggTrade`);
+
   ws.onopen=()=>status.innerText='Connected';
+
   ws.onmessage=e=>{
     const t=JSON.parse(e.data);
     const p=+t.p,q=+t.q,side=t.m?'sell':'buy';
     lastPrice=p;
     addTrade(p,q,side);
-    priceHistory.push(p);
-    deltaHistory.push(side==='buy'?q:-q);
-    if(priceHistory.length>60){priceHistory.shift();deltaHistory.shift();}
+    finalizeHour();
     render();
   };
+
+  ws.onclose=()=>status.innerText='Disconnected';
 };
 
 loadSymbols();
