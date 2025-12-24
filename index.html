@@ -1,323 +1,212 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8"/>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Institutional Market State Engine</title>
 
-<!-- 🔥 Cache control for GitHub Pages (NO new repo required) -->
+<!-- CACHE KILL (GitHub Pages fix) -->
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
-
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Institutional Major Levels</title>
 
 <style>
 :root{
   --bg:#071226;
   --card:#0f2030;
+  --border:#152433;
+  --text:#e6f0fb;
   --muted:#9fb0c8;
   --accent:#00d084;
-  --sell:#ff7b7b;
-  --text:#e6f0fb;
-  --border:#152433;
+  --danger:#ff6b6b;
 }
-*{box-sizing:border-box}
 body{
   margin:0;
-  font-family:Inter,system-ui,Roboto,Arial;
+  font-family:Inter,system-ui,Arial;
   background:var(--bg);
   color:var(--text);
 }
-.wrap{max-width:1200px;margin:auto;padding:14px}
+.wrap{max-width:1200px;margin:auto;padding:16px}
 .card{
   background:var(--card);
   border:1px solid var(--border);
   border-radius:12px;
-  padding:12px;
-  margin-top:12px;
+  padding:14px;
+  margin-bottom:14px;
 }
-.header{
-  display:flex;
-  justify-content:space-between;
-  align-items:center;
-  gap:12px;
-  flex-wrap:wrap;
-}
-.title{font-size:20px;font-weight:600}
-.subtitle{font-size:13px;color:var(--muted)}
+.header{display:flex;justify-content:space-between;align-items:center;gap:12px}
 select,button{
-  padding:8px 10px;
-  border-radius:8px;
-  border:1px solid var(--border);
   background:#071b2b;
   color:var(--text);
+  border:1px solid var(--border);
+  border-radius:8px;
+  padding:8px 10px;
 }
 button{cursor:pointer}
-.small{font-size:12px;color:var(--muted)}
-.level{
-  padding:8px;
-  border-radius:8px;
-  background:rgba(255,255,255,0.02);
-  margin-bottom:6px;
-}
-.stop{
-  margin-top:4px;
-  color:var(--sell);
-  font-size:12px;
-}
-.progress{
-  height:6px;
-  background:#152433;
-  border-radius:4px;
-  overflow:hidden;
+.state{
+  font-size:20px;
+  font-weight:700;
   margin-top:6px;
 }
-.progress > div{
-  height:100%;
-  width:0%;
-  background:var(--accent);
-  transition:width .2s linear;
+.level{
+  padding:8px;
+  background:rgba(255,255,255,0.03);
+  border-radius:8px;
+  margin-bottom:6px;
 }
+.stop{color:var(--danger);font-size:13px}
+.small{font-size:12px;color:var(--muted)}
 </style>
 </head>
 
 <body>
 <div class="wrap">
 
-<!-- HEADER -->
-<div class="header card">
+<div class="card header">
   <div>
-    <div class="title">Institutional Major Levels</div>
-    <div class="subtitle">
-      Non-repainting • Executed trades • Stabilized clusters • ±1000 range
-    </div>
+    <div style="font-size:20px;font-weight:600">Institutional Market State</div>
+    <div class="small">Execution • Stops • State logic (1H)</div>
   </div>
   <div>
     <select id="symbol"></select>
-    <button id="connectBtn">Connect</button>
+    <button id="connect">Connect</button>
     <span id="status" class="small">Disconnected</span>
   </div>
 </div>
 
-<!-- PRICE -->
 <div class="card">
   <div class="small">Current Price</div>
-  <div id="price" style="font-size:22px;font-weight:600">—</div>
+  <div id="price" style="font-size:26px;font-weight:700">—</div>
+  <div class="state" id="state">—</div>
 </div>
 
-<!-- LEVELS -->
 <div class="card">
-  <div class="small">MAJOR INSTITUTIONAL LEVELS (±1000)</div>
-  <div id="levels" style="margin-top:8px">Waiting…</div>
-  <div class="progress"><div id="progressBar"></div></div>
+  <div class="small">Major Execution Clusters & Stop Zones</div>
+  <div id="levels" style="margin-top:10px">Waiting…</div>
 </div>
 
 </div>
 
 <script>
-/* =====================================================
-   GLOBAL STATE
-===================================================== */
-let ws = null;
-let running = false;
-let lastPrice = null;
-let clusterMap = new Map();
+/* ==============================
+   STATE ENGINE
+============================== */
+const STATE={
+  ACCUMULATION:'ACCUMULATION',
+  EXECUTION:'EXECUTION',
+  DISTRIBUTION:'DISTRIBUTION',
+  RESET:'RESET'
+};
 
-const RANGE_POINTS = 1000;
+let clusters=new Map();
+let priceHistory=[];
+let deltaHistory=[];
+let liquidityHistory=[];
+let lastPrice=null;
+let currentState=STATE.RESET;
+let ws=null;
 
-/* =====================================================
-   UTILS
-===================================================== */
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+function avg(a){return a.reduce((x,y)=>x+y,0)/a.length||0}
 
-function getBinSize(price){
-  return price >= 1000 ? 100 : price * 0.005;
+function updateState(){
+  const vol=Math.max(...priceHistory)-Math.min(...priceHistory);
+  const delta=avg(deltaHistory);
+  const liq=avg(liquidityHistory);
+
+  if(vol<liq*0.15 && Math.abs(delta)<liq*0.1) currentState=STATE.ACCUMULATION;
+  else if(Math.abs(delta)>liq*0.6) currentState=STATE.EXECUTION;
+  else if(vol>liq*0.4 && Math.abs(delta)<liq*0.2) currentState=STATE.DISTRIBUTION;
+  else if(vol<liq*0.08) currentState=STATE.RESET;
+
+  document.getElementById('state').innerText=currentState;
 }
 
-function addToCluster(price, qty, side){
-  const binSize = getBinSize(price);
-  const bin = Math.round(price / binSize) * binSize;
+/* ==============================
+   CLUSTER & STOP LOGIC
+============================== */
+function binSize(p){return p>=1000?100:p*0.01}
 
-  if(!clusterMap.has(bin)){
-    clusterMap.set(bin,{
-      price: bin,
-      totalVol: 0,
-      buyVol: 0,
-      sellVol: 0
-    });
+function addTrade(price,qty,side){
+  const b=binSize(price);
+  const key=Math.round(price/b)*b;
+  if(!clusters.has(key)) clusters.set(key,{price:key,vol:0,buy:0,sell:0});
+  const c=clusters.get(key);
+  c.vol+=qty;
+  side==='buy'?c.buy+=qty:c.sell+=qty;
+}
+
+function majorClusters(){
+  const arr=[...clusters.values()];
+  if(arr.length<5) return [];
+  const a=avg(arr.map(x=>x.vol));
+  return arr.filter(x=>x.vol>a*1.8).sort((a,b)=>b.vol-a.vol).slice(0,6);
+}
+
+function stopZones(c){
+  const range=binSize(c.price)*2;
+  if(c.sell>c.buy*1.5){
+    return {type:'BUY STOPS',from:c.price+range,to:c.price+range*1.5};
   }
-  const c = clusterMap.get(bin);
-  c.totalVol += qty;
-  side === 'buy' ? c.buyVol += qty : c.sellVol += qty;
-}
-
-/* =====================================================
-   CLUSTER LOGIC (MAJOR ONLY)
-===================================================== */
-function getMajorClusters(price){
-  const min = price - RANGE_POINTS;
-  const max = price + RANGE_POINTS;
-
-  const arr = [...clusterMap.values()]
-    .filter(c => c.price >= min && c.price <= max);
-
-  if(arr.length < 5) return [];
-
-  const avg = arr.reduce((s,c)=>s+c.totalVol,0) / arr.length;
-
-  return arr
-    .filter(c => c.totalVol >= avg * 1.5)
-    .sort((a,b)=>b.totalVol - a.totalVol)
-    .slice(0,6);
-}
-
-function sellerStopZone(c){
-  if(c.sellVol > c.buyVol * 1.6){
-    const buf = c.price >= 1000 ? 150 : c.price * 0.01;
-    return { from: c.price + buf, to: c.price + buf * 1.5 };
+  if(c.buy>c.sell*1.5){
+    return {type:'SELL STOPS',from:c.price-range*1.5,to:c.price-range};
   }
   return null;
 }
 
-/* =====================================================
+/* ==============================
    RENDER
-===================================================== */
+============================== */
 function render(){
   if(!lastPrice) return;
-  document.getElementById('price').innerText = lastPrice.toFixed(2);
+  document.getElementById('price').innerText=lastPrice.toFixed(2);
+  updateState();
 
-  const majors = getMajorClusters(lastPrice);
-  const el = document.getElementById('levels');
+  const el=document.getElementById('levels');
+  const majors=majorClusters();
+  if(!majors.length){el.innerHTML='Building…';return;}
 
-  if(majors.length === 0){
-    el.innerHTML = '<span class="small">Building clusters…</span>';
-    return;
-  }
-
-  el.innerHTML = majors.map(c=>{
-    const sl = sellerStopZone(c);
+  el.innerHTML=majors.map(c=>{
+    const s=stopZones(c);
     return `
       <div class="level">
-        <b>${c.price.toFixed(2)}</b>
-        — Vol ${c.totalVol.toFixed(0)}
-        ${sl ? `<div class="stop">
-          Seller SL: ${sl.from.toFixed(2)} – ${sl.to.toFixed(2)}
-        </div>` : ``}
+        <b>${c.price.toFixed(2)}</b> — Vol ${c.vol.toFixed(0)}
+        ${s?`<div class="stop">${s.type}: ${s.from.toFixed(2)} → ${s.to.toFixed(2)}</div>`:''}
       </div>`;
   }).join('');
 }
 
-/* =====================================================
-   🔥 SAFE HISTORICAL PRELOAD (429-PROOF)
-===================================================== */
-async function preloadHistoricalTrades(symbol){
-  clusterMap.clear();
-  const bar = document.getElementById('progressBar');
-  bar.style.width = '0%';
-
-  let fromId = null;
-  let lastFromId = null;
-  let requests = 0;
-
-  const MAX_REQUESTS = 120; // safe cap
-
-  while(true){
-    let url =
-      `https://fapi.binance.com/fapi/v1/aggTrades?symbol=${symbol}&limit=1000`;
-    if(fromId !== null) url += `&fromId=${fromId}`;
-
-    const res = await fetch(url);
-
-    // 🔥 HARD STOP on 429 (no retry loop)
-    if(res.status === 429){
-      console.warn('429 hit — stopping historical preload');
-      break;
-    }
-
-    const data = await res.json();
-    if(!Array.isArray(data) || data.length === 0) break;
-
-    for(const t of data){
-      const price = +t.p;
-      const qty   = +t.q;
-      const side  = t.m ? 'sell' : 'buy';
-      addToCluster(price, qty, side);
-      lastPrice = price;
-    }
-
-    fromId = data[0].a - 1;
-
-    // 🔥 prevent cursor lock
-    if(fromId === lastFromId){
-      console.warn('fromId stuck — stopping preload');
-      break;
-    }
-    lastFromId = fromId;
-
-    requests++;
-    bar.style.width = Math.min(95, (requests / MAX_REQUESTS) * 100) + '%';
-
-    if(requests >= MAX_REQUESTS) break;
-    if(clusterMap.size >= 40) break;
-
-    await sleep(250); // throttle
-  }
-}
-
-/* =====================================================
-   SYMBOL LOADER (ALL COINS)
-===================================================== */
+/* ==============================
+   BINANCE DATA
+============================== */
 async function loadSymbols(){
-  const sel = document.getElementById('symbol');
-  const res = await fetch('https://fapi.binance.com/fapi/v1/exchangeInfo');
-  const data = await res.json();
-
-  const list = data.symbols
-    .filter(s => s.contractType === 'PERPETUAL' && s.symbol.endsWith('USDT'))
-    .map(s => s.symbol)
-    .sort();
-
-  sel.innerHTML = list.map(s => `<option>${s}</option>`).join('');
-  sel.value = 'BTCUSDT';
+  const r=await fetch('https://fapi.binance.com/fapi/v1/exchangeInfo');
+  const d=await r.json();
+  document.getElementById('symbol').innerHTML=
+    d.symbols.filter(s=>s.contractType==='PERPETUAL')
+    .map(s=>`<option>${s.symbol}</option>`).join('');
 }
 
-/* =====================================================
-   CONNECT
-===================================================== */
-document.getElementById('connectBtn').onclick = async ()=>{
-  if(running) return;
-
-  const symbol = document.getElementById('symbol').value;
-  document.getElementById('status').innerText = 'Loading…';
-
-  await preloadHistoricalTrades(symbol);
-  render();
-
-  ws = new WebSocket(
-    `wss://fstream.binance.com/ws/${symbol.toLowerCase()}@aggTrade`
-  );
-
-  ws.onopen = ()=>{
-    running = true;
-    document.getElementById('status').innerText = 'Connected';
-  };
-
-  ws.onmessage = e=>{
-    const t = JSON.parse(e.data);
-    lastPrice = +t.p;
-    addToCluster(+t.p, +t.q, t.m ? 'sell' : 'buy');
+document.getElementById('connect').onclick=()=>{
+  if(ws) ws.close();
+  clusters.clear();
+  priceHistory=[];
+  deltaHistory=[];
+  liquidityHistory=[];
+  const sym=document.getElementById('symbol').value.toLowerCase();
+  ws=new WebSocket(`wss://fstream.binance.com/ws/${sym}@aggTrade`);
+  ws.onopen=()=>status.innerText='Connected';
+  ws.onmessage=e=>{
+    const t=JSON.parse(e.data);
+    const p=+t.p,q=+t.q,side=t.m?'sell':'buy';
+    lastPrice=p;
+    addTrade(p,q,side);
+    priceHistory.push(p);
+    deltaHistory.push(side==='buy'?q:-q);
+    if(priceHistory.length>60){priceHistory.shift();deltaHistory.shift();}
     render();
-  };
-
-  ws.onclose = ()=>{
-    running = false;
-    document.getElementById('status').innerText = 'Disconnected';
   };
 };
 
-/* =====================================================
-   INIT
-===================================================== */
 loadSymbols();
 </script>
 </body>
