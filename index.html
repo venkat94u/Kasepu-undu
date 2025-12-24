@@ -2,8 +2,14 @@
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
+
+<!-- 🔥 CACHE CONTROL (NO NEW REPO NEEDED) -->
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Institutional Major Clusters</title>
+<title>Institutional Major Levels</title>
 
 <style>
 :root{
@@ -78,12 +84,11 @@ button{cursor:pointer}
 <body>
 <div class="wrap">
 
-<!-- HEADER -->
 <div class="header card">
   <div>
     <div class="title">Institutional Major Levels</div>
     <div class="subtitle">
-      Non-repainting • Executed trades • 2-day clusters • ±1000 range
+      Non-repainting • Executed trades • Stabilized clusters • ±1000 range
     </div>
   </div>
   <div>
@@ -93,13 +98,11 @@ button{cursor:pointer}
   </div>
 </div>
 
-<!-- PRICE -->
 <div class="card">
   <div class="small">Current Price</div>
   <div id="price" style="font-size:22px;font-weight:600">—</div>
 </div>
 
-<!-- MAJOR LEVELS -->
 <div class="card">
   <div class="small">MAJOR INSTITUTIONAL LEVELS (±1000)</div>
   <div id="levels" style="margin-top:8px">Waiting…</div>
@@ -109,9 +112,9 @@ button{cursor:pointer}
 </div>
 
 <script>
-/* ======================================================
+/* =========================
    GLOBAL STATE
-====================================================== */
+========================= */
 let ws = null;
 let running = false;
 let lastPrice = null;
@@ -119,71 +122,60 @@ let clusterMap = new Map();
 
 const RANGE_POINTS = 1000;
 
-/* ======================================================
-   BIN LOGIC
-====================================================== */
+/* =========================
+   UTILS
+========================= */
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
 function getBinSize(price){
-  if(price >= 1000) return 100;
-  return price * 0.005;
+  return price >= 1000 ? 100 : price * 0.005;
 }
 
 function addToCluster(price, qty, side){
-  const binSize = getBinSize(price);
-  const bin = Math.round(price / binSize) * binSize;
-
+  const bin = Math.round(price / getBinSize(price)) * getBinSize(price);
   if(!clusterMap.has(bin)){
-    clusterMap.set(bin,{
-      price:bin,
-      totalVol:0,
-      buyVol:0,
-      sellVol:0
-    });
+    clusterMap.set(bin,{ price:bin, totalVol:0, buyVol:0, sellVol:0 });
   }
   const c = clusterMap.get(bin);
   c.totalVol += qty;
   side === 'buy' ? c.buyVol += qty : c.sellVol += qty;
 }
 
-/* ======================================================
-   MAJOR CLUSTER FILTER
-====================================================== */
 function getMajorClusters(price){
   const min = price - RANGE_POINTS;
   const max = price + RANGE_POINTS;
 
-  const arr = [...clusterMap.values()]
-    .filter(c => c.price >= min && c.price <= max);
-
+  const arr = [...clusterMap.values()].filter(
+    c => c.price >= min && c.price <= max
+  );
   if(arr.length < 5) return [];
 
-  const avg = arr.reduce((s,c)=>s+c.totalVol,0) / arr.length;
-
-  return arr
-    .filter(c => c.totalVol >= avg * 1.5)
-    .sort((a,b)=>b.totalVol - a.totalVol)
-    .slice(0,6);
+  const avg = arr.reduce((s,c)=>s+c.totalVol,0)/arr.length;
+  return arr.filter(c=>c.totalVol>=avg*1.5)
+            .sort((a,b)=>b.totalVol-a.totalVol)
+            .slice(0,6);
 }
 
 function sellerStopZone(c){
   if(c.sellVol > c.buyVol * 1.6){
-    const buf = c.price >= 1000 ? 150 : c.price * 0.01;
-    return {from:c.price+buf,to:c.price+buf*1.5};
+    const b = c.price>=1000 ? 150 : c.price*0.01;
+    return { from:c.price+b, to:c.price+b*1.5 };
   }
   return null;
 }
 
-/* ======================================================
-   UI RENDER
-====================================================== */
+/* =========================
+   RENDER
+========================= */
 function render(){
   if(!lastPrice) return;
-
   document.getElementById('price').innerText = lastPrice.toFixed(2);
-  const el = document.getElementById('levels');
 
   const majors = getMajorClusters(lastPrice);
-  if(majors.length === 0){
-    el.innerHTML = '<span class="small">Building clusters…</span>';
+  const el = document.getElementById('levels');
+
+  if(majors.length===0){
+    el.innerHTML='<span class="small">Building clusters…</span>';
     return;
   }
 
@@ -193,115 +185,90 @@ function render(){
       <div class="level">
         <b>${c.price.toFixed(2)}</b>
         — Vol ${c.totalVol.toFixed(0)}
-        ${sl ? `<div class="stop">
+        ${sl?`<div class="stop">
           Seller SL: ${sl.from.toFixed(2)} – ${sl.to.toFixed(2)}
-        </div>` : ``}
+        </div>`:''}
       </div>`;
   }).join('');
 }
 
-/* ======================================================
-   🔥 2-DAY HISTORICAL PRELOAD (PAGINATED)
-====================================================== */
-async function preloadHistoricalTrades(symbol, days = 2){
+/* =========================
+   SAFE HISTORICAL PRELOAD
+========================= */
+async function preloadHistoricalTrades(symbol){
   clusterMap.clear();
-  const endTime = Date.now();
-  const startLimit = endTime - days*24*60*60*1000;
-
-  let fromId = null;
-  let loaded = 0;
-
   const bar = document.getElementById('progressBar');
   bar.style.width = '0%';
+
+  let fromId = null;
+  let requests = 0;
+  const MAX_REQUESTS = 180;
 
   while(true){
     let url =
       `https://fapi.binance.com/fapi/v1/aggTrades?symbol=${symbol}&limit=1000`;
-    if(fromId !== null) url += `&fromId=${fromId}`;
+    if(fromId!==null) url += `&fromId=${fromId}`;
 
     const res = await fetch(url);
+    if(res.status===429){
+      await sleep(2000);
+      continue;
+    }
+
     const data = await res.json();
-    if(!Array.isArray(data) || data.length === 0) break;
+    if(!Array.isArray(data)||data.length===0) break;
 
     for(const t of data){
-      if(t.T < startLimit) return;
-      const price = parseFloat(t.p);
-      const qty   = parseFloat(t.q);
-      const side  = t.m ? 'sell' : 'buy';
-      addToCluster(price, qty, side);
+      const price = +t.p, qty = +t.q, side = t.m?'sell':'buy';
+      addToCluster(price,qty,side);
       lastPrice = price;
-      loaded++;
     }
 
     fromId = data[0].a - 1;
+    requests++;
+    bar.style.width = Math.min(95,requests/MAX_REQUESTS*100)+'%';
 
-    if(loaded % 5000 === 0){
-      bar.style.width = Math.min(90, loaded/2000) + '%';
-      await new Promise(r => setTimeout(r, 15));
-    }
+    if(requests>=MAX_REQUESTS || clusterMap.size>=40) break;
+    await sleep(120);
   }
 }
 
-/* ======================================================
-   SYMBOL LOADER (ALL COINS)
-====================================================== */
+/* =========================
+   SYMBOL LOADER
+========================= */
 async function loadSymbols(){
-  const sel = document.getElementById('symbol');
-  sel.innerHTML = '<option>Loading…</option>';
-
-  const res = await fetch('https://fapi.binance.com/fapi/v1/exchangeInfo');
-  const data = await res.json();
-
-  const list = data.symbols
-    .filter(s=>s.contractType==='PERPETUAL' && s.symbol.endsWith('USDT'))
-    .map(s=>s.symbol)
-    .sort();
-
-  sel.innerHTML = list.map(s=>`<option>${s}</option>`).join('');
-  sel.value = list.includes('BTCUSDT') ? 'BTCUSDT' : list[0];
+  const sel=document.getElementById('symbol');
+  const res=await fetch('https://fapi.binance.com/fapi/v1/exchangeInfo');
+  const data=await res.json();
+  const list=data.symbols
+    .filter(s=>s.contractType==='PERPETUAL'&&s.symbol.endsWith('USDT'))
+    .map(s=>s.symbol).sort();
+  sel.innerHTML=list.map(s=>`<option>${s}</option>`).join('');
+  sel.value='BTCUSDT';
 }
 
-/* ======================================================
+/* =========================
    CONNECT
-====================================================== */
-document.getElementById('connectBtn').onclick = async ()=>{
+========================= */
+document.getElementById('connectBtn').onclick=async()=>{
   if(running) return;
+  const symbol=document.getElementById('symbol').value;
+  document.getElementById('status').innerText='Loading…';
 
-  const symbol = document.getElementById('symbol').value;
-  document.getElementById('status').innerText = 'Loading 2 days…';
-
-  await preloadHistoricalTrades(symbol, 2);
+  await preloadHistoricalTrades(symbol);
   render();
 
-  ws = new WebSocket(
-    `wss://fstream.binance.com/ws/${symbol.toLowerCase()}@aggTrade`
-  );
-
-  ws.onopen = ()=>{
-    running = true;
-    document.getElementById('status').innerText = 'Connected';
-    document.getElementById('progressBar').style.width = '100%';
-  };
-
-  ws.onmessage = e=>{
-    const t = JSON.parse(e.data);
-    const price = parseFloat(t.p);
-    const qty   = parseFloat(t.q);
-    const side  = t.m ? 'sell' : 'buy';
-    lastPrice = price;
-    addToCluster(price, qty, side);
+  ws=new WebSocket(`wss://fstream.binance.com/ws/${symbol.toLowerCase()}@aggTrade`);
+  ws.onopen=()=>{running=true;document.getElementById('status').innerText='Connected';};
+  ws.onmessage=e=>{
+    const t=JSON.parse(e.data);
+    lastPrice=+t.p;
+    addToCluster(+t.p,+t.q,t.m?'sell':'buy');
     render();
   };
-
-  ws.onclose = ()=>{
-    running = false;
-    document.getElementById('status').innerText = 'Disconnected';
-  };
+  ws.onclose=()=>{running=false;document.getElementById('status').innerText='Disconnected';};
 };
 
-/* ======================================================
-   INIT
-====================================================== */
 loadSymbols();
 </script>
 </body>
